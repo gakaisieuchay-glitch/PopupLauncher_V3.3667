@@ -1,0 +1,284 @@
+name: Popup Launcher - Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: popup-launcher-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: "17"
+  GRADLE_VERSION: "8.9"
+  ANDROID_API_LEVEL: "35"
+  BUILD_TOOLS_VERSION: "35.0.0"
+
+jobs:
+  build:
+    name: Build Debug + Release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Set up Android SDK
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if [ -n "${ANDROID_HOME:-}" ]; then
+            SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          else
+            SDKMANAGER="$(find "${ANDROID_SDK_ROOT:-$HOME}" -type f -path '*/cmdline-tools/*/bin/sdkmanager' 2>/dev/null | head -n 1 || true)"
+          fi
+
+          if [ -z "${SDKMANAGER}" ] || [ ! -x "${SDKMANAGER}" ]; then
+            echo "::error::Android sdkmanager was not found on the GitHub runner."
+            exit 1
+          fi
+
+          yes | "${SDKMANAGER}" --licenses >/dev/null || true
+          "${SDKMANAGER}" \
+            "platform-tools" \
+            "platforms;android-${ANDROID_API_LEVEL}" \
+            "build-tools;${BUILD_TOOLS_VERSION}"
+
+          echo "Android SDK:"
+          if [ -n "${ANDROID_HOME:-}" ]; then
+            echo "${ANDROID_HOME}"
+          else
+            echo "${ANDROID_SDK_ROOT:-unknown}"
+          fi
+
+      - name: Locate Android project
+        id: project
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          # Preferred layout: repository already contains the Android project.
+          if [ -f "settings.gradle.kts" ] || [ -f "settings.gradle" ]; then
+            ROOT="$PWD"
+            echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+            echo "mode=source" >> "$GITHUB_OUTPUT"
+            echo "Android project found at repository root."
+            exit 0
+          fi
+
+          # Also support the user's original use-case:
+          # repository contains PopupLauncher_MAX_Performance.zip.
+          mapfile -t ZIPS < <(
+            find . -maxdepth 3 -type f -name '*.zip' \
+              ! -path './.git/*' \
+              ! -path './_source/*' | sort
+          )
+
+          if [ "${#ZIPS[@]}" -eq 0 ]; then
+            echo "::error::No Android project found. Put settings.gradle(.kts) at repository root, or commit one project ZIP."
+            exit 1
+          fi
+
+          if [ "${#ZIPS[@]}" -gt 1 ]; then
+            echo "Multiple ZIP files found; selecting the first sorted candidate:"
+          fi
+
+          ZIP_FILE="${ZIPS[0]}"
+          rm -rf _source
+          mkdir -p _source
+          unzip -q "$ZIP_FILE" -d _source
+
+          SETTINGS="$(
+            find _source -type f \
+              \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) \
+              ! -path '*/.gradle/*' | sort | head -n 1
+          )"
+
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::The ZIP does not contain settings.gradle(.kts)."
+            exit 1
+          fi
+
+          ROOT="$(dirname "$SETTINGS")"
+          echo "root=$PWD/$ROOT" >> "$GITHUB_OUTPUT"
+          echo "mode=zip" >> "$GITHUB_OUTPUT"
+          echo "Android project extracted to: $PWD/$ROOT"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+          cache-provider: basic
+
+      - name: Verify Java / Gradle / Android SDK
+        working-directory: ${{ steps.project.outputs.root }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          java -version
+          gradle --version
+
+          echo "ANDROID_HOME=${ANDROID_HOME:-}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-}"
+
+          if [ -n "${ANDROID_HOME:-}" ]; then
+            test -d "${ANDROID_HOME}/platforms/android-${ANDROID_API_LEVEL}"
+            test -d "${ANDROID_HOME}/build-tools/${BUILD_TOOLS_VERSION}"
+          fi
+
+      - name: Validate project structure
+        working-directory: ${{ steps.project.outputs.root }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          test -f settings.gradle.kts || test -f settings.gradle
+          test -f build.gradle.kts || test -f build.gradle
+          test -f app/build.gradle.kts || test -f app/build.gradle
+          test -f app/src/main/AndroidManifest.xml
+
+          test -f app/src/main/java/com/example/popuplauncher/FloatingService.kt
+          test -f app/src/main/java/com/example/popuplauncher/ShizukuManager.kt
+          test -f app/src/main/java/com/example/popuplauncher/RootManager.kt
+
+          echo "Project structure OK."
+
+      - name: Validate critical Android configuration
+        working-directory: ${{ steps.project.outputs.root }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          grep -Eq 'minSdk[[:space:]]*=[[:space:]]*24' app/build.gradle.kts
+          grep -Eq 'targetSdk[[:space:]]*=[[:space:]]*35' app/build.gradle.kts
+          grep -Eq 'compileSdk[[:space:]]*=[[:space:]]*35' app/build.gradle.kts
+          grep -Eq 'isMinifyEnabled[[:space:]]*=[[:space:]]*true' app/build.gradle.kts
+          grep -Eq 'isShrinkResources[[:space:]]*=[[:space:]]*true' app/build.gradle.kts
+
+          grep -q 'android:foregroundServiceType="specialUse"' app/src/main/AndroidManifest.xml
+          grep -q 'PROPERTY_SPECIAL_USE_FGS_SUBTYPE' app/src/main/AndroidManifest.xml
+
+          grep -q 'dev.rikka.shizuku:api:13.1.5' app/build.gradle.kts
+          grep -q 'dev.rikka.shizuku:provider:13.1.5' app/build.gradle.kts
+
+          echo "Critical Android configuration OK."
+
+      - name: Check Kotlin / XML sources
+        working-directory: ${{ steps.project.outputs.root }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          # Catch accidental conflict markers and obvious unfinished merges.
+          if grep -RInE '^(<<<<<<<|=======|>>>>>>>)' app/src --include='*.kt' --include='*.java' --include='*.xml' --include='*.aidl'; then
+            echo "::error::Git merge conflict markers found in app/src."
+            exit 1
+          fi
+
+          # Validate the Android manifest as XML.
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          ET.parse("app/src/main/AndroidManifest.xml")
+          print("AndroidManifest.xml: XML OK")
+          PY
+
+      - name: Clean build
+        working-directory: ${{ steps.project.outputs.root }}
+        run: gradle --no-daemon --stacktrace clean
+
+      - name: Android Lint
+        working-directory: ${{ steps.project.outputs.root }}
+        run: gradle --no-daemon --stacktrace :app:lintDebug
+
+      - name: Unit tests
+        working-directory: ${{ steps.project.outputs.root }}
+        run: gradle --no-daemon --stacktrace :app:testDebugUnitTest
+
+      - name: Compile debug
+        working-directory: ${{ steps.project.outputs.root }}
+        run: gradle --no-daemon --stacktrace :app:compileDebugKotlin
+
+      - name: Build APKs
+        working-directory: ${{ steps.project.outputs.root }}
+        run: |
+          set -Eeuo pipefail
+          gradle --no-daemon --stacktrace \
+            :app:assembleDebug \
+            :app:assembleRelease
+
+      - name: Verify APK files
+        id: apk
+        working-directory: ${{ steps.project.outputs.root }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          DEBUG_APK="$(find app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' | sort | head -n 1 || true)"
+          RELEASE_APK="$(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' | sort | head -n 1 || true)"
+
+          if [ -z "$DEBUG_APK" ]; then
+            echo "::error::Debug APK was not produced."
+            exit 1
+          fi
+
+          if [ -z "$RELEASE_APK" ]; then
+            echo "::error::Release APK was not produced."
+            exit 1
+          fi
+
+          echo "debug_apk=$DEBUG_APK" >> "$GITHUB_OUTPUT"
+          echo "release_apk=$RELEASE_APK" >> "$GITHUB_OUTPUT"
+
+          echo "=== APK files ==="
+          ls -lh "$DEBUG_APK" "$RELEASE_APK"
+
+          echo "=== SHA-256 ==="
+          sha256sum "$DEBUG_APK" "$RELEASE_APK"
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PopupLauncher-debug-${{ github.sha }}
+          path: ${{ steps.project.outputs.root }}/${{ steps.apk.outputs.debug_apk }}
+          if-no-files-found: error 
+          retention-days: 30
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PopupLauncher-release-${{ github.sha }}
+          path: ${{ steps.project.outputs.root }}/${{ steps.apk.outputs.release_apk }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload mapping file
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PopupLauncher-mapping-${{ github.sha }}
+          path: |
+            ${{ steps.project.outputs.root }}/app/build/outputs/mapping/release/mapping.txt
+            ${{ steps.project.outputs.root }}/app/build/outputs/mapping/release/seeds.txt
+            ${{ steps.project.outputs.root }}/app/build/outputs/mapping/release/usage.txt
+          if-no-files-found: warn
+          retention-days: 30
+          
